@@ -69,10 +69,15 @@ class Ledger
     /**
      * A gateway wrote down that it began a payment (the row every gateway
      * writes when it makes an invoice): that is a payment, waiting.
+     *
+     * Only a row the shop vouches for. A callback whose signature did not
+     * verify is logged too (PaymentApplier), and a payment made from IT would
+     * be the sender's word — "paid, this much" — counted as money the next
+     * time the order's payments are added up.
      */
     public function started(Transaction $transaction): void
     {
-        if (! $transaction->order_id || $transaction->external_id === null || $transaction->payment_id) {
+        if (! $transaction->verified || ! $transaction->order_id || $transaction->external_id === null || $transaction->payment_id) {
             return;
         }
 

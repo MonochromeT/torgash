@@ -1473,15 +1473,75 @@ class Backups
      * A plain-SQL dump through psql, in one transaction. Its extension lines
      * are left out for the same reason as in `withoutExtensions()` — `DROP
      * EXTENSION` is the superuser's — and the extensions created first.
+     *
+     * psql is a program, not a parser: a backslash command in the file (`\!
+     * cmd`, `\o /path`, `\copy … to 'file'`) is run by it, as the shop's own
+     * system user. A dump pg_dump wrote has none, so a file with one was not
+     * made by pg_dump or was changed since — by whoever could write to the
+     * bucket or the SFTP account the copy sat in — and the restore refuses it
+     * (`filterPlainDump`). A psql that knows `\restrict` (17.6, 16.10, 15.14,
+     * 14.19, 13.22 and every 18) is also told to run NOTHING but SQL between
+     * two markers only this process knows, which catches a command hidden
+     * after a statement on the same line as well.
      */
     protected function restoreSql(string $sql, string $target): void
     {
-        $in = fopen($sql, 'rb');
         $filtered = dirname($sql).DIRECTORY_SEPARATOR.'restore.sql';
-        $out = fopen($filtered, 'wb');
+        $extensions = self::filterPlainDump($sql, $filtered, self::psqlRestricts() ? bin2hex(random_bytes(16)) : null);
+
+        foreach ($extensions as $extension) {
+            try {
+                $this->pg('psql', ['-d', $target, '-c', 'create extension if not exists '.$extension]);
+            } catch (Throwable) {
+            }
+        }
+
+        $this->pg('psql', ['-v', 'ON_ERROR_STOP=1', '--single-transaction', '-q', '-d', $target, '-f', $filtered]);
+    }
+
+    /**
+     * The plain dump at $from written to $to as something psql may be handed:
+     * extension statements taken out (returned by name, to be made first) and
+     * no psql command anywhere outside the COPY data.
+     *
+     * The data of a `COPY … FROM stdin;` block is copied untouched up to its
+     * `\.` — psql does not read commands there, and a row whose first column
+     * is NULL begins with `\N`. Outside it a line beginning with a backslash
+     * is refused — except pg_dump's own `\restrict`/`\unrestrict` markers,
+     * which are dropped and replaced by this process's own pair when
+     * $restrictKey is given (a psql that knows them then runs nothing but SQL
+     * in between, wherever a command stands on a line).
+     *
+     * @return list<string> the extensions the dump created
+     *
+     * @throws RuntimeException the dump holds a psql command
+     */
+    public static function filterPlainDump(string $from, string $to, ?string $restrictKey = null): array
+    {
+        $in = fopen($from, 'rb');
+        $out = fopen($to, 'wb');
+        if ($in === false || $out === false) {
+            throw new RuntimeException('The dump could not be read or the filtered copy not written.');
+        }
+
         $extensions = [];
+        $copying = false;
+        $number = 0;
+
+        if ($restrictKey !== null) {
+            fwrite($out, '\\restrict '.$restrictKey."\n");
+        }
 
         while (($line = fgets($in)) !== false) {
+            $number++;
+
+            if ($copying) {
+                $copying = ! preg_match('/^\\\\\.\s*$/', $line);
+                fwrite($out, $line);
+
+                continue;
+            }
+
             if (preg_match('/^CREATE EXTENSION IF NOT EXISTS ("?)([A-Za-z0-9_]+)\1/', $line, $m)) {
                 $extensions[] = $m[2];
 
@@ -1492,19 +1552,56 @@ class Backups
                 continue;
             }
 
+            if (preg_match('/^\\\\(un)?restrict\s+\S+\s*$/', $line)) {
+                continue;
+            }
+
+            if (preg_match('/^\s*\\\\/', $line)) {
+                fclose($in);
+                fclose($out);
+                @unlink($to);
+
+                throw new RuntimeException(__('The database dump holds a psql command on line :line (:text). pg_dump never writes one, so the file was not made by pg_dump or was changed since; nothing was restored.', [
+                    'line' => $number,
+                    'text' => Str::limit(trim($line), 60),
+                ]));
+            }
+
+            if (preg_match('/^COPY\s.*\sFROM\s+stdin;\s*$/i', $line)) {
+                $copying = true;
+            }
+
             fwrite($out, $line);
         }
+
+        if ($restrictKey !== null) {
+            fwrite($out, "\n".'\\unrestrict '.$restrictKey."\n");
+        }
+
         fclose($in);
         fclose($out);
 
-        foreach ($extensions as $extension) {
-            try {
-                $this->pg('psql', ['-d', $target, '-c', 'create extension if not exists '.$extension]);
-            } catch (Throwable) {
-            }
+        return $extensions;
+    }
+
+    /**
+     * Does this server's psql know `\restrict`? Added to every supported
+     * branch in August 2025 (18, 17.6, 16.10, 15.14, 14.19, 13.22); an older
+     * psql answers it with an error and ON_ERROR_STOP would end the restore.
+     */
+    public static function psqlRestricts(): bool
+    {
+        $version = self::toolVersion('psql');
+
+        if ($version === null || ! preg_match('/\)\s+(\d+)(?:\.(\d+))?/', $version, $m)) {
+            return false;
         }
 
-        $this->pg('psql', ['-v', 'ON_ERROR_STOP=1', '--single-transaction', '-q', '-d', $target, '-f', $filtered]);
+        $major = (int) $m[1];
+        $minor = (int) ($m[2] ?? 0);
+        $since = [13 => 22, 14 => 19, 15 => 14, 16 => 10, 17 => 6];
+
+        return $major >= 18 || (isset($since[$major]) && $minor >= $since[$major]);
     }
 
     /**

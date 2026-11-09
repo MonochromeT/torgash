@@ -71,7 +71,7 @@ class PaymentApplier
         // story that must not go backwards: the order being partly paid by a
         // deposit says nothing about whether the invoice for the rest has
         // moved (PLAN §40.10/4). An unverified message is recorded against
-        // nothing.
+        // nothing — see below.
         // A button asked about one payment names it (`$about`): the answer is
         // about that payment whatever id the gateway writes on it.
         $payment = $verified ? ($about ?? $this->ledger->forEvent($gateway, $order, $event)) : null;
@@ -85,16 +85,23 @@ class PaymentApplier
         // back. The gateway's own number stays in `raw`.
         $reported = $event->amount === null ? null : $order->baseFromCharge($event->amount);
 
+        // A message whose signature did not verify is kept as evidence on the
+        // order it named — and nothing else. Its external id, event key and
+        // amount are whatever the sender typed: written down, the id would
+        // start a payment (Ledger::started) that the next genuine event adds
+        // up as real money, be found by a gateway looking its invoice up by
+        // id, and the key would make the real message "already seen". The
+        // payload itself stays in `raw`.
         $transaction = Transaction::create([
             'gateway' => $gateway,
             'order_id' => $order->id,
             'payment_id' => $payment?->id,
-            'external_id' => $event->externalId,
+            'external_id' => $verified ? $event->externalId : null,
             // The key is dropped on a duplicate rather than colliding: the point
             // is to keep the evidence that it arrived twice, not to refuse it.
-            'event_key' => $duplicate ? null : $event->eventKey,
+            'event_key' => $verified && ! $duplicate ? $event->eventKey : null,
             'state' => $event->state,
-            'amount' => $reported,
+            'amount' => $verified ? $reported : null,
             'verified' => $verified,
             'applied' => $shouldApply,
             'summary' => $this->summary($event, $verified, $duplicate, $shouldApply),

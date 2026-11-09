@@ -13,6 +13,7 @@ use Torgash\Checkout\Models\Order;
 use Torgash\Checkout\Models\PaymentMethod;
 use Torgash\Checkout\Orders\PaymentState;
 use Torgash\Payments\Models\Binding;
+use Torgash\Payments\Models\Payment;
 use Torgash\Payments\Models\Transaction;
 use Torgash\Shipping\Models\ShippingMethod;
 
@@ -170,7 +171,7 @@ class GatewayCallbackTest extends TestCase
         )->assertOk();
 
         $this->postJson('http://localhost/payment/fake/callback', [
-            'status' => 'success', 'amount' => 100_00, 'reference' => $order->id,
+            'status' => 'success', 'amount' => 100_00, 'reference' => $order->id, 'invoiceId' => 'forged-inv', 'messageId' => 'm-1',
         ], ['X-Signature' => 'forged'])->assertOk();
 
         $this->assertSame(PaymentState::PENDING, $order->fresh()->payment_state);
@@ -178,6 +179,42 @@ class GatewayCallbackTest extends TestCase
         $transaction = Transaction::latest('id')->firstOrFail();
         $this->assertFalse($transaction->verified);
         $this->assertFalse($transaction->applied);
+        $this->assertSame($order->id, $transaction->order_id, 'kept as evidence on the order it named');
+
+        // ...and nothing the sender typed is taken as fact: no payment begins
+        // from it, no invoice id is remembered, the amount is not written down,
+        // and the message id stays free for the genuine message.
+        $this->assertSame(0, Payment::count());
+        $this->assertNull($transaction->external_id);
+        $this->assertNull($transaction->event_key);
+        $this->assertNull($transaction->amount);
+
+        $this->sendCallback($order, ['status' => 'success', 'amount' => 100_00, 'messageId' => 'm-1'])->assertOk();
+        $this->assertSame(PaymentState::PAID, $order->fresh()->payment_state);
+        $this->assertTrue(Transaction::latest('id')->firstOrFail()->applied, 'a key a forger used first is not "already seen"');
+    }
+
+    public function test_a_forged_payment_is_not_added_up_by_the_next_genuine_event(): void
+    {
+        $order = $this->order();
+
+        // "Paid in full", says somebody who is not the gateway, naming an
+        // invoice of their own...
+        $this->postJson('http://localhost/payment/fake/callback', [
+            'status' => 'success', 'amount' => 100_00, 'reference' => $order->id, 'invoiceId' => 'forged-inv',
+        ], ['X-Signature' => 'forged'])->assertOk();
+
+        // ...and then the gateway reports, truthfully, that the real invoice
+        // is still open. The order's state is read from ALL its payments: a
+        // forged one among them would have made it paid here.
+        $this->sendCallback($order, ['status' => 'processing', 'invoiceId' => 'real-inv', 'messageId' => 'm-2'])->assertOk();
+
+        $order->refresh();
+
+        $this->assertSame(PaymentState::PENDING, $order->payment_state);
+        $this->assertSame(0, $order->paid_total);
+        $this->assertNull($order->paid_at);
+        $this->assertSame(['real-inv'], Payment::pluck('external_id')->all());
     }
 
     public function test_the_same_message_twice_is_one_payment(): void
